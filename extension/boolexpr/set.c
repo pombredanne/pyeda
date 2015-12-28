@@ -10,176 +10,158 @@
 #include "boolexpr.h"
 
 
+/* Maximum load allowed before enlargement */
 #define MAX_LOAD 1.5
 
-
-/*
-** From: http://planetmath.org/goodhashtableprimes
-*/
-
-#define _MIN_IDX 5
-#define _MAX_IDX 30
-
-static size_t _primes[] = {
-    0, 0, 0, 0, 0,
-
-    /* (2^5,  2^6)  */ 53,
-    /* (2^6,  2^7)  */ 97,
-    /* (2^7,  2^8)  */ 193,
-    /* (2^8,  2^9)  */ 389,
-    /* (2^9,  2^10) */ 769,
-    /* (2^10, 2^11) */ 1543,
-    /* (2^11, 2^12) */ 3079,
-    /* (2^12, 2^13) */ 6151,
-    /* (2^13, 2^14) */ 12289,
-    /* (2^14, 2^15) */ 24593,
-    /* (2^15, 2^16) */ 49157,
-    /* (2^16, 2^17) */ 98317,
-    /* (2^17, 2^18) */ 196613,
-    /* (2^18, 2^19) */ 393241,
-    /* (2^19, 2^20) */ 786433,
-    /* (2^20, 2^21) */ 1572869,
-    /* (2^21, 2^22) */ 3145739,
-    /* (2^22, 2^23) */ 6291469,
-    /* (2^23, 2^24) */ 12582917,
-    /* (2^24, 2^25) */ 25165843,
-    /* (2^25, 2^26) */ 50331653,
-    /* (2^26, 2^27) */ 100663319,
-    /* (2^27, 2^28) */ 201326611,
-    /* (2^28, 2^29) */ 402653189,
-    /* (2^29, 2^30) */ 805306457,
-    /* (2^30, 2^31) */ 1610612741,
-};
+/* Min/Max indices in the primes table */
+#define MIN_IDX 4
+#define MAX_IDX 30
 
 
-struct BoolExprSetItem {
-    struct BoolExpr *key;
-    struct BoolExprSetItem *tail;
-};
+/* Define static size_t _primes[] */
+#include "primes-inl.c"
+
+
+static size_t
+_hash(struct BX_Set *set, struct BoolExpr *key)
+{
+    return (size_t) key % _primes[set->_pridx];
+}
+
+
+static bool
+_eq(struct BoolExpr *key1, struct BoolExpr *key2)
+{
+    return key1 == key2;
+}
 
 
 static void
-_list_del(struct BoolExprSetItem *list)
+_list_del(struct BX_SetItem *list)
 {
-    if (list != (struct BoolExprSetItem *) NULL) {
+    if (list) {
         _list_del(list->tail);
-        BoolExpr_DecRef(list->key);
-
+        BX_DecRef(list->key);
         free(list);
     }
 }
 
 
 static bool
-_list_contains(struct BoolExprSetItem *list, struct BoolExpr *key)
+_list_contains(struct BX_SetItem *list, struct BoolExpr *key)
 {
-    if (list == (struct BoolExprSetItem *) NULL)
+    if (!list)
         return false;
-    else if (list->key == key)
+
+    if (_eq(list->key, key))
         return true;
-    else
-        return _list_contains(list->tail, key);
+
+    return _list_contains(list->tail, key);
 }
 
 
-struct BoolExprSet *
-BoolExprSet_New(size_t (*prehash)(struct BoolExpr *))
+struct BX_Set *
+BX_Set_New(void)
 {
-    struct BoolExprSet *set;
-    size_t pridx = _MIN_IDX;
-    size_t width = _primes[pridx];
+    struct BX_Set *set;
+    size_t width = _primes[MIN_IDX];
 
-    set = (struct BoolExprSet *) malloc(sizeof(struct BoolExprSet));
+    set = malloc(sizeof(struct BX_Set));
     if (set == NULL)
         return NULL; // LCOV_EXCL_LINE
 
-    set->items = (struct BoolExprSetItem **) malloc(width * sizeof(struct BoolExprSetItem *));
+    set->_pridx = MIN_IDX;
+    set->length = 0;
+    set->items = malloc(width * sizeof(struct BX_SetItem *));
     if (set->items == NULL) {
         free(set);   // LCOV_EXCL_LINE
         return NULL; // LCOV_EXCL_LINE
     }
 
+    /* Initialize items to NULL */
     for (size_t i = 0; i < width; ++i)
-        set->items[i] = (struct BoolExprSetItem *) NULL;
-
-    set->prehash = prehash;
-    set->length = 0;
-    set->pridx = pridx;
+        set->items[i] = (struct BX_SetItem *) NULL;
 
     return set;
 }
 
 
-static size_t
-_var2int(struct BoolExpr *var)
-{
-    return (size_t) (var->data.lit.uniqid - 1);
-}
-
-
-struct BoolExprSet *
-BoolExprVarSet_New(void)
-{
-    return BoolExprSet_New(_var2int);
-}
-
-
-static size_t
-_lit2int(struct BoolExpr *lit)
-{
-    return (size_t) (lit->data.lit.uniqid < 0 ? -2 * lit->data.lit.uniqid - 2
-                                              :  2 * lit->data.lit.uniqid - 1);
-}
-
-
-struct BoolExprSet *
-BoolExprLitSet_New(void)
-{
-    return BoolExprSet_New(_lit2int);
-}
-
-
 void
-BoolExprSet_Del(struct BoolExprSet *set)
+BX_Set_Del(struct BX_Set *set)
 {
-    for (size_t i = 0; i < _primes[set->pridx]; ++i)
+    for (size_t i = 0; i < _primes[set->_pridx]; ++i)
         _list_del(set->items[i]);
-
     free(set->items);
     free(set);
 }
 
 
-static size_t
-_hash(struct BoolExprSet *set, struct BoolExpr *key)
+void
+BX_SetIter_Init(struct BX_SetIter *it, struct BX_Set *set)
 {
-    return set->prehash(key) % _primes[set->pridx];
+    it->_set = set;
+    it->item = (struct BX_SetItem *) NULL;
+    it->done = true;
+
+    for (it->_index = 0; it->_index < _primes[set->_pridx]; it->_index += 1) {
+        if (set->items[it->_index]) {
+            it->item = set->items[it->_index];
+            it->done = false;
+            break;
+        }
+    }
+}
+
+
+void
+BX_SetIter_Next(struct BX_SetIter *it)
+{
+    if (it->done)
+        return;
+
+    if (it->item->tail) {
+        it->item = it->item->tail;
+        return;
+    }
+
+    for (it->_index += 1; it->_index < _primes[it->_set->_pridx]; it->_index += 1) {
+        if (it->_set->items[it->_index]) {
+            it->item = it->_set->items[it->_index];
+            return;
+        }
+    }
+
+    it->item = (struct BX_SetItem *) NULL;
+    it->done = true;
 }
 
 
 static bool
-_insert(struct BoolExprSet *set, struct BoolExpr *key)
+_set_insert(struct BX_Set *set, struct BoolExpr *key)
 {
-    size_t index = _hash(set, key);;
-    struct BoolExprSetItem *item = set->items[index];
+    size_t index = _hash(set, key);
+    struct BX_SetItem *item;
+    struct BX_SetItem **tail;
 
-    while (item != (struct BoolExprSetItem *) NULL) {
-        if (item->key == key) {
-            BoolExpr_DecRef(item->key);
-            item->key = BoolExpr_IncRef(key);
+    tail = &set->items[index];
+    for (item = set->items[index]; item; item = item->tail) {
+        if (_eq(item->key, key)) {
+            BX_DecRef(item->key);
+            item->key = BX_IncRef(key);
             return true;
         }
-        item = item->tail;
+        tail = &item->tail;
     }
 
-    item = (struct BoolExprSetItem *) malloc(sizeof(struct BoolExprSetItem));
+    item = malloc(sizeof(struct BX_SetItem));
     if (item == NULL)
         return false; // LCOV_EXCL_LINE
 
-    item->key = BoolExpr_IncRef(key);
-    item->tail = set->items[index];
+    item->key = BX_IncRef(key);
+    item->tail = (struct BX_SetItem *) NULL;
 
-    set->items[index] = item;
+    *tail = item;
+
     set->length += 1;
 
     return true;
@@ -187,34 +169,44 @@ _insert(struct BoolExprSet *set, struct BoolExpr *key)
 
 
 static bool
-_enlarge(struct BoolExprSet *set)
+_enlarge(struct BX_Set *set)
 {
-    struct BoolExprSetItem *item;
+    struct BX_SetItem *item;
 
-    size_t pridx = set->pridx;
-    struct BoolExprSetItem **items = set->items;
+    size_t pridx = set->_pridx;
+    size_t length = set->length;
+    struct BX_SetItem **items = set->items;
 
+    size_t old_width = _primes[pridx];
+    size_t new_width = _primes[pridx + 1];
+
+    set->_pridx += 1;
     set->length = 0;
-    set->pridx += 1;
-    set->items = (struct BoolExprSetItem **) malloc(_primes[set->pridx] * sizeof(struct BoolExprSetItem *));
-    for (size_t i = 0; i < _primes[set->pridx]; ++i)
-        set->items[i] = (struct BoolExprSetItem *) NULL;
+    set->items = malloc(new_width * sizeof(struct BX_SetItem *));
+    if (set->items == NULL)
+        return false; // LCOV_EXCL_LINE
 
-    for (size_t i = 0; i < _primes[pridx]; ++i) {
-        item = items[i];
-        while (item != (struct BoolExprSetItem *) NULL) {
-            if (!_insert(set, item->key)) {
+    for (size_t i = 0; i < new_width; ++i)
+        set->items[i] = (struct BX_SetItem *) NULL;
+
+    for (size_t i = 0; i < old_width; ++i) {
+        for (item = items[i]; item; item = item->tail) {
+            if (!_set_insert(set, item->key)) {
                 /* LCOV_EXCL_START */
                 for (size_t j = 0; j < i; ++j)
-                    _list_del(items[j]);
-                free(items);
+                    _list_del(set->items[j]);
+                free(set->items);
+                set->_pridx = pridx;
+                set->length = length;
+                set->items = items;
                 return false;
                 /* LCOV_EXCL_STOP */
             }
-            item = item->tail;
         }
-        _list_del(items[i]);
     }
+
+    for (size_t i = 0; i < old_width; ++i)
+        _list_del(items[i]);
     free(items);
 
     return true;
@@ -222,16 +214,16 @@ _enlarge(struct BoolExprSet *set)
 
 
 bool
-BoolExprSet_Insert(struct BoolExprSet *set, struct BoolExpr *key)
+BX_Set_Insert(struct BX_Set *set, struct BoolExpr *key)
 {
     double load;
 
-    if (!_insert(set, key))
+    if (!_set_insert(set, key))
         return false; // LCOV_EXCL_LINE
 
-    load = (double) set->length / (double) _primes[set->pridx];
+    load = (double) set->length / (double) _primes[set->_pridx];
 
-    if (set->pridx < _MAX_IDX && load > MAX_LOAD) {
+    if (set->_pridx < MAX_IDX && load > MAX_LOAD) {
         if (!_enlarge(set))
             return false; // LCOV_EXCL_LINE
     }
@@ -241,24 +233,22 @@ BoolExprSet_Insert(struct BoolExprSet *set, struct BoolExpr *key)
 
 
 bool
-BoolExprSet_Remove(struct BoolExprSet *set, struct BoolExpr *key)
+BX_Set_Remove(struct BX_Set *set, struct BoolExpr *key)
 {
     size_t index = _hash(set, key);
-    struct BoolExprSetItem **p = &set->items[index];
-    struct BoolExprSetItem *item = set->items[index];
+    struct BX_SetItem *item;
+    struct BX_SetItem **tail;
 
-    while (item != (struct BoolExprSetItem *) NULL) {
-        if (item->key == key) {
-            BoolExpr_DecRef(item->key);
-            *p = item->tail;
+    tail = &set->items[index];
+    for (item = set->items[index]; item; item = item->tail) {
+        if (_eq(item->key, key)) {
+            BX_DecRef(item->key);
+            *tail = item->tail;
             free(item);
             set->length -= 1;
-
             return true;
         }
-
-        p = &item->tail;
-        item = item->tail;
+        tail = &item->tail;
     }
 
     return false;
@@ -266,10 +256,165 @@ BoolExprSet_Remove(struct BoolExprSet *set, struct BoolExpr *key)
 
 
 bool
-BoolExprSet_Contains(struct BoolExprSet *set, struct BoolExpr *key)
+BX_Set_Contains(struct BX_Set *set, struct BoolExpr *key)
 {
     size_t index = _hash(set, key);
 
     return _list_contains(set->items[index], key);
+}
+
+
+bool
+BX_Set_EQ(struct BX_Set *self, struct BX_Set *other)
+{
+    if (self->length != other->length)
+        return false;
+
+    struct BX_SetItem *item;
+
+    /* All items in self must also be in other (and vice versa) */
+    for (size_t i = 0; i < _primes[self->_pridx]; ++i) {
+        for (item = self->items[i]; item; item = item->tail) {
+            if (!BX_Set_Contains(other, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Set_NE(struct BX_Set *self, struct BX_Set *other)
+{
+    return !BX_Set_EQ(self, other);
+}
+
+
+bool
+BX_Set_LTE(struct BX_Set *self, struct BX_Set *other)
+{
+    if (self->length > other->length)
+        return false;
+
+    struct BX_SetItem *item;
+
+    /* All items in self must also be in other */
+    for (size_t i = 0; i < _primes[self->_pridx]; ++i) {
+        for (item = self->items[i]; item; item = item->tail) {
+            if (!BX_Set_Contains(other, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Set_GT(struct BX_Set *self, struct BX_Set *other)
+{
+    if (self->length <= other->length)
+        return false;
+
+    struct BX_SetItem *item;
+
+    /* All items in other must also be in self */
+    for (size_t i = 0; i < _primes[other->_pridx]; ++i) {
+        for (item = other->items[i]; item; item = item->tail) {
+            if (!BX_Set_Contains(self, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Set_GTE(struct BX_Set *self, struct BX_Set *other)
+{
+    if (self->length < other->length)
+        return false;
+
+    struct BX_SetItem *item;
+
+    /* All items in other must also be in self */
+    for (size_t i = 0; i < _primes[other->_pridx]; ++i) {
+        for (item = other->items[i]; item; item = item->tail) {
+            if (!BX_Set_Contains(self, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Set_LT(struct BX_Set *self, struct BX_Set *other)
+{
+    if (self->length >= other->length)
+        return false;
+
+    struct BX_SetItem *item;
+
+    /* All items in self must also be in other */
+    for (size_t i = 0; i < _primes[self->_pridx]; ++i) {
+        for (item = self->items[i]; item; item = item->tail) {
+            if (!BX_Set_Contains(other, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Set_Update(struct BX_Set *self, struct BX_Set *other)
+{
+    struct BX_SetItem *item;
+
+    for (size_t i = 0; i < _primes[other->_pridx]; ++i) {
+        for (item = other->items[i]; item; item = item->tail) {
+            if (!BX_Set_Insert(self, item->key))
+                return false; // LCOV_EXCL_LINE
+        }
+    }
+
+    return true;
+}
+
+
+void
+BX_Set_Clear(struct BX_Set *set)
+{
+    for (size_t i = 0; i < _primes[set->_pridx]; ++i) {
+        if (set->items[i]) {
+            _list_del(set->items[i]);
+            set->items[i] = (struct BX_SetItem *) NULL;
+        }
+    }
+
+    set->length = 0;
+}
+
+
+struct BoolExpr **
+BX_Set_ToExprs(struct BX_Set *set)
+{
+    struct BoolExpr **exprs;
+
+    exprs = malloc(set->length * sizeof(struct BoolExpr *));
+    if (exprs == NULL)
+        return NULL; // LCOV_EXCL_LINE
+
+    for (size_t i = 0, index = 0; i < _primes[set->_pridx]; ++i) {
+        for (struct BX_SetItem *item = set->items[i]; item; item = item->tail)
+            exprs[index++] = item->key;
+    }
+
+    return exprs;
 }
 

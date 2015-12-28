@@ -1368,17 +1368,30 @@ class ConjNormalForm(NormalForm):
         clauses = {frozenset(-idx for idx in clause) for clause in self.clauses}
         return DisjNormalForm(self.nvars, clauses)
 
-    def satisfy_one(self, assumptions=None):
+    def satisfy_one(self, assumptions=None, **params):
         """
         If the input CNF is satisfiable, return a satisfying input point.
         A contradiction will return None.
         """
-        return picosat.satisfy_one(self.nvars, self.clauses,
-                                   assumptions=assumptions)
+        verbosity = params.get('verbosity', 0)
+        default_phase = params.get('default_phase', 2)
+        propagation_limit = params.get('propagation_limit', -1)
+        decision_limit = params.get('decision_limit', -1)
+        seed = params.get('seed', 1)
+        return picosat.satisfy_one(self.nvars, self.clauses, assumptions,
+                                   verbosity, default_phase, propagation_limit,
+                                   decision_limit, seed)
 
-    def satisfy_all(self):
+    def satisfy_all(self, **params):
         """Iterate through all satisfying input points."""
-        yield from picosat.satisfy_all(self.nvars, self.clauses)
+        verbosity = params.get('verbosity', 0)
+        default_phase = params.get('default_phase', 2)
+        propagation_limit = params.get('propagation_limit', -1)
+        decision_limit = params.get('decision_limit', -1)
+        seed = params.get('seed', 1)
+        yield from picosat.satisfy_all(self.nvars, self.clauses, verbosity,
+                                       default_phase, propagation_limit,
+                                       decision_limit, seed)
 
     @staticmethod
     def soln2point(soln, litmap):

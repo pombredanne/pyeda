@@ -21,21 +21,22 @@
 #include <stdlib.h>
 
 #include "boolexpr.h"
+#include "memcheck.h"
+#include "share.h"
+#include "util.h"
+
 
 #define CMP(x, y) ((x) < (y) ? -1 : (x) > (y))
 
+#define COMPLEMENTARY(x, y) \
+    (BX_IS_LIT(x) && BX_IS_LIT(y) && \
+     ((x)->data.lit.uniqid == -((y)->data.lit.uniqid)))
 
-/* boolexpr.c */
-struct BoolExpr * _op_new(BoolExprKind kind, size_t n, struct BoolExpr **xs);
-struct BoolExpr * _orandxor_new(BoolExprKind kind, size_t n, struct BoolExpr **xs);
-
-/* util.c */
-struct BoolExpr * _op_transform(struct BoolExpr *op, struct BoolExpr * (*fn)(struct BoolExpr *));
-void _mark_flags(struct BoolExpr *ex, BoolExprFlags f);
 
 /* simple.c */
-static struct BoolExpr * _simple_op(BoolExprKind kind, size_t n, struct BoolExpr **xs);
-static struct BoolExpr * _simple_opn(BoolExprKind kind, size_t n, ...);
+static struct BoolExpr * _simple_op(BX_Kind kind, size_t n, struct BoolExpr **xs);
+static struct BoolExpr * _simple_op2(BX_Kind kind, struct BoolExpr *x0, struct BoolExpr *x1);
+static struct BoolExpr * _simple_nop(BX_Kind kind, size_t n, struct BoolExpr **xs);
 
 
 /* NOTE: Equality testing can get expensive, so keep it simple */
@@ -62,7 +63,7 @@ _cmp(const void *p1, const void *p2)
     const struct BoolExpr *a = *((struct BoolExpr **) p1);
     const struct BoolExpr *b = *((struct BoolExpr **) p2);
 
-    if (IS_LIT(a) && IS_LIT(b)) {
+    if (BX_IS_LIT(a) && BX_IS_LIT(b)) {
         long abs_a = labs(a->data.lit.uniqid);
         long abs_b = labs(b->data.lit.uniqid);
 
@@ -83,15 +84,16 @@ _cmp(const void *p1, const void *p2)
 
 
 static size_t
-_count_assoc_args(struct BoolExpr *op)
+_count_orand_args(struct BoolExpr *op)
 {
     size_t count = 0;
 
-    for (size_t i = 0; i < op->data.xs->length; ++i)
+    for (size_t i = 0; i < op->data.xs->length; ++i) {
         if (op->data.xs->items[i]->kind == op->kind)
             count += op->data.xs->items[i]->data.xs->length;
         else
             count += 1;
+    }
 
     return count;
 }
@@ -101,40 +103,55 @@ _count_assoc_args(struct BoolExpr *op)
 static struct BoolExpr *
 _orand_simplify(struct BoolExpr *op)
 {
-    size_t n = _count_assoc_args(op);
-    struct BoolExpr *flat[n];
+    size_t n = _count_orand_args(op);
+    struct BoolExpr **flat;
     size_t flat_len = 0;
+    struct BoolExpr **uniq;
+    size_t uniq_len = 0;
+    struct BoolExpr *xi, *xj;
+    struct BoolExpr *y;
+
+    flat = malloc(n * sizeof(struct BoolExpr *));
+    if (flat == NULL)
+        return NULL; // LCOV_EXCL_LINE
 
     /* 1. Flatten arguments, and eliminate {0, 1} */
     for (size_t i = 0; i < op->data.xs->length; ++i) {
-        struct BoolExpr *item_i = op->data.xs->items[i];
+        xi = op->data.xs->items[i];
         /* Or(1, x) <=> 1 */
-        if (item_i == DOMINATOR[op->kind]) {
-            return BoolExpr_IncRef(DOMINATOR[op->kind]);
+        if (xi == _bx_dominator[op->kind]) {
+            free(flat);
+            return BX_IncRef(_bx_dominator[op->kind]);
         }
         /* Or(Or(x0, x1), x2) <=> Or(x0, x1, x2) */
-        else if (item_i->kind == op->kind) {
-            for (size_t j = 0; j < item_i->data.xs->length; ++j) {
-                struct BoolExpr *item_j = item_i->data.xs->items[j];
+        else if (xi->kind == op->kind) {
+            for (size_t j = 0; j < xi->data.xs->length; ++j) {
+                xj = xi->data.xs->items[j];
                 /* Or(1, x) <=> 1 */
-                if (item_j == DOMINATOR[op->kind])
-                    return BoolExpr_IncRef(DOMINATOR[op->kind]);
+                if (xj == _bx_dominator[op->kind]) {
+                    free(flat);
+                    return BX_IncRef(_bx_dominator[op->kind]);
+                }
                 /* Or(0, x) <=> x */
-                else if (item_j != IDENTITY[op->kind])
-                    flat[flat_len++] = item_j;
+                else if (xj != _bx_identity[op->kind]) {
+                    flat[flat_len++] = xj;
+                }
             }
         }
         /* Or(0, x) <=> x */
-        else if (item_i != IDENTITY[op->kind]) {
-            flat[flat_len++] = item_i;
+        else if (xi != _bx_identity[op->kind]) {
+            flat[flat_len++] = xi;
         }
     }
 
     /* 2. Sort arguments, so you get ~a, ~a, a, a, ~b, ... */
     qsort(flat, flat_len, sizeof(struct BoolExpr *), _cmp);
 
-    struct BoolExpr *uniq[flat_len];
-    size_t uniq_len = 0;
+    uniq = malloc(flat_len * sizeof(struct BoolExpr *));
+    if (uniq == NULL) {
+        free(flat);  // LCOV_EXCL_LINE
+        return NULL; // LCOV_EXCL_LINE
+    }
 
     /* 3. Apply: Or(~x, x) <=> 1, Or(x, x) <=> x */
     for (size_t i = 0; i < flat_len; ++i) {
@@ -143,15 +160,43 @@ _orand_simplify(struct BoolExpr *op)
         }
         else {
             /* Or(~x, x) <=> 1 */
-            if (COMPLEMENTARY(uniq[uniq_len-1], flat[i]))
-                return BoolExpr_IncRef(DOMINATOR[op->kind]);
+            if (COMPLEMENTARY(uniq[uniq_len-1], flat[i])) {
+                free(flat);
+                free(uniq);
+                return BX_IncRef(_bx_dominator[op->kind]);
+            }
             /* Or(x, x) <=> x */
-            else if (!_eq(flat[i], uniq[uniq_len-1]))
+            else if (!_eq(flat[i], uniq[uniq_len-1])) {
                 uniq[uniq_len++] = flat[i];
+            }
         }
     }
 
-    return _orandxor_new(op->kind, uniq_len, uniq);
+    free(flat);
+
+    y = _bx_orandxor_new(op->kind, uniq_len, uniq);
+
+    free(uniq);
+
+    return y;
+}
+
+
+static size_t
+_count_xor_args(struct BoolExpr *op)
+{
+    size_t count = 0;
+
+    for (size_t i = 0; i < op->data.xs->length; ++i) {
+        if (BX_IS_XOR(op->data.xs->items[i]))
+            count += op->data.xs->items[i]->data.xs->length;
+        else if (BX_IS_XNOR(op->data.xs->items[i]))
+            count += op->data.xs->items[i]->data.xs->items[0]->data.xs->length;
+        else
+            count += 1;
+    }
+
+    return count;
 }
 
 
@@ -161,36 +206,58 @@ _xor_simplify(struct BoolExpr *op)
 {
     bool parity = true;
 
-    size_t n = _count_assoc_args(op);
-    struct BoolExpr *flat[n];
+    size_t n = _count_xor_args(op);
+    struct BoolExpr **flat;
     size_t flat_len = 0;
+    struct BoolExpr **uniq;
+    size_t uniq_len = 0;
+    struct BoolExpr *xi, *xj;
+    struct BoolExpr *y;
+
+    flat = malloc(n * sizeof(struct BoolExpr *));
+    if (flat == NULL)
+        return NULL; // LCOV_EXCL_LINE
 
     /* 1. Flatten arguments, and eliminate {0, 1} */
     for (size_t i = 0; i < op->data.xs->length; ++i) {
-        struct BoolExpr *item_i = op->data.xs->items[i];
-        if (IS_CONST(item_i)) {
-            parity ^= (bool) item_i->kind;
+        xi = op->data.xs->items[i];
+        if (BX_IS_CONST(xi)) {
+            parity ^= (bool) xi->kind;
         }
         /* Xor(Xor(x0, x1), x2) <=> Xor(x0, x1, x2) */
-        else if (item_i->kind == op->kind) {
-            for (size_t j = 0; j < item_i->data.xs->length; ++j) {
-                struct BoolExpr *item_j = item_i->data.xs->items[j];
-                if (IS_CONST(item_j))
-                    parity ^= (bool) item_j->kind;
+        else if (BX_IS_XOR(xi)) {
+            for (size_t j = 0; j < xi->data.xs->length; ++j) {
+                xj = xi->data.xs->items[j];
+                if (BX_IS_CONST(xj))
+                    parity ^= (bool) xj->kind;
                 else
-                    flat[flat_len++] = item_j;
+                    flat[flat_len++] = xj;
+            }
+        }
+        /* Xor(Xnor(x0, x1), x2) <=> Xnor(x0, x1, x2) */
+        else if (BX_IS_XNOR(xi)) {
+            parity ^= true;
+            for (size_t j = 0; j < xi->data.xs->items[0]->data.xs->length; ++j) {
+                xj = xi->data.xs->items[0]->data.xs->items[j];
+                if (BX_IS_CONST(xj))
+                    parity ^= (bool) xj->kind;
+                else
+                    flat[flat_len++] = xj;
             }
         }
         else {
-            flat[flat_len++] = item_i;
+            flat[flat_len++] = xi;
         }
     }
 
     /* 2. Sort arguments, so you get ~a, ~a, a, a, ~b, ... */
     qsort(flat, flat_len, sizeof(struct BoolExpr *), _cmp);
 
-    struct BoolExpr *uniq[flat_len];
-    size_t uniq_len = 0;
+    uniq = malloc(flat_len * sizeof(struct BoolExpr *));
+    if (uniq == NULL) {
+        free(flat);  // LCOV_EXCL_LINE
+        return NULL; // LCOV_EXCL_LINE
+    }
 
     /* 3. Apply: Xor(~x, x) <=> 1, Xor(x, x) <=> 0 */
     for (size_t i = 0; i < flat_len; ++i) {
@@ -213,7 +280,13 @@ _xor_simplify(struct BoolExpr *op)
         }
     }
 
-    return parity ? Xor(uniq_len, uniq) : Xnor(uniq_len, uniq);
+    free(flat);
+
+    y = parity ? BX_Xor(uniq_len, uniq) : BX_Xnor(uniq_len, uniq);
+
+    free(uniq);
+
+    return y;
 }
 
 
@@ -225,29 +298,42 @@ _eq_simplify(struct BoolExpr *op)
     bool found_one = false;
 
     size_t length = op->data.xs->length;
-    struct BoolExpr *flat[length];
+    struct BoolExpr **flat;
     size_t flat_len = 0;
+    struct BoolExpr **uniq;
+    size_t uniq_len = 0;
+    struct BoolExpr *xi;
+    struct BoolExpr *y;
+
+    flat = malloc(length * sizeof(struct BoolExpr *));
+    if (flat == NULL)
+        return NULL; // LCOV_EXCL_LINE
 
     /* 1. Eliminate {0, 1} */
     for (size_t i = 0; i < length; ++i) {
-        struct BoolExpr *item_i = op->data.xs->items[i];
-        if (IS_ZERO(item_i))
+        xi = op->data.xs->items[i];
+        if (BX_IS_ZERO(xi))
             found_zero = true;
-        else if (IS_ONE(item_i))
+        else if (BX_IS_ONE(xi))
             found_one = true;
         else
-            flat[flat_len++] = item_i;
+            flat[flat_len++] = xi;
     }
 
     /* Equal(0, 1) <=> 0 */
-    if (found_zero && found_one)
-        return BoolExpr_IncRef(&Zero);
+    if (found_zero && found_one) {
+        free(flat);
+        return BX_IncRef(&BX_Zero);
+    }
 
     /* 2. Sort arguments, so you get ~a, ~a, a, a, ~b, ... */
     qsort(flat, flat_len, sizeof(struct BoolExpr *), _cmp);
 
-    struct BoolExpr *uniq[flat_len];
-    size_t uniq_len = 0;
+    uniq = malloc(flat_len * sizeof(struct BoolExpr *));
+    if (uniq == NULL) {
+        free(flat);  // LCOV_EXCL_LINE
+        return NULL; // LCOV_EXCL_LINE
+    }
 
     /* 3. Apply: Equal(~x, x) <=> 0, Equal(x0, x0, x1) <=> Equal(x0, x1) */
     for (size_t i = 0; i < flat_len; ++i) {
@@ -256,53 +342,46 @@ _eq_simplify(struct BoolExpr *op)
         }
         else {
             /* Equal(~x, x) <=> 0 */
-            if (COMPLEMENTARY(uniq[uniq_len-1], flat[i]))
-                return BoolExpr_IncRef(&Zero);
+            if (COMPLEMENTARY(uniq[uniq_len-1], flat[i])) {
+                free(flat);
+                free(uniq);
+                return BX_IncRef(&BX_Zero);
+            }
             /* Equal(x0, x0, x1) <=> Equal(x0, x1) */
             else if (!_eq(flat[i], uniq[uniq_len-1]))
                 uniq[uniq_len++] = flat[i];
         }
     }
 
-    struct BoolExpr *y;
+    free(flat);
 
     if (found_zero) {
         /* Equal(0) <=> 1 */
-        if (uniq_len == 0) {
-            y = BoolExpr_IncRef(&One);
-        }
+        if (uniq_len == 0)
+            y = BX_IncRef(&BX_One);
         /* Equal(0, x) <=> ~x */
-        else if (uniq_len == 1) {
-            CHECK_NULL(y, Not(uniq[0]));
-        }
+        else if (uniq_len == 1)
+            y = BX_Not(uniq[0]);
         /* Equal(0, x0, x1) <=> Nor(x0, x1) */
-        else {
-            struct BoolExpr *temp;
-            CHECK_NULL(temp, _simple_op(OP_OR, uniq_len, uniq));
-            CHECK_NULL_1(y, Not(temp), temp);
-            BoolExpr_DecRef(temp);
-        }
+        else
+            y = _simple_nop(BX_OP_OR, uniq_len, uniq);
     }
     else if (found_one) {
         /* Equal(1) <=> 1 */
-        if (uniq_len == 0) {
-            y = BoolExpr_IncRef(&One);
-        }
+        if (uniq_len == 0)
+            y = BX_IncRef(&BX_One);
         /* Equal(1, x) <=> x */
-        else if (uniq_len == 1) {
-            y = BoolExpr_IncRef(uniq[0]);
-        }
-        /* Equal(1, x0, ...) <=> Nand(x0, ...) */
-        else {
-            struct BoolExpr *temp;
-            CHECK_NULL(temp, _simple_op(OP_AND, uniq_len, uniq));
-            CHECK_NULL_1(y, Not(temp), temp);
-            BoolExpr_DecRef(temp);
-        }
+        else if (uniq_len == 1)
+            y = BX_IncRef(uniq[0]);
+        /* Equal(1, x0, ...) <=> And(x0, ...) */
+        else
+            y = _simple_op(BX_OP_AND, uniq_len, uniq);
     }
     else {
-        CHECK_NULL(y, Equal(uniq_len, uniq));
+        y = BX_Equal(uniq_len, uniq);
     }
+
+    free(uniq);
 
     return y;
 }
@@ -312,7 +391,7 @@ _eq_simplify(struct BoolExpr *op)
 static struct BoolExpr *
 _not_simplify(struct BoolExpr *op)
 {
-    return Not(op->data.xs->items[0]);
+    return BX_Not(op->data.xs->items[0]);
 }
 
 
@@ -324,22 +403,26 @@ _impl_simplify(struct BoolExpr *op)
     struct BoolExpr *q = op->data.xs->items[1];
 
     /* Implies(0, q) <=> Implies(p, 1) <=> 1 */
-    if (IS_ZERO(p) || IS_ONE(q))
-        return BoolExpr_IncRef(&One);
+    if (BX_IS_ZERO(p) || BX_IS_ONE(q))
+        return BX_IncRef(&BX_One);
+
     /* Implies(1, q) <=> q */
-    else if (IS_ONE(p))
-        return BoolExpr_IncRef(q);
+    if (BX_IS_ONE(p))
+        return BX_IncRef(q);
+
     /* Implies(p, 0) <=> ~p */
-    else if (IS_ZERO(q))
-        return Not(p);
+    if (BX_IS_ZERO(q))
+        return BX_Not(p);
+
     /* Implies(p, p) <=> 1 */
-    else if (_eq(p, q))
-        return BoolExpr_IncRef(&One);
+    if (_eq(p, q))
+        return BX_IncRef(&BX_One);
+
     /* Implies(~p, p) <=> p */
-    else if (COMPLEMENTARY(p, q))
-        return BoolExpr_IncRef(q);
-    else
-        return Implies(p, q);
+    if (COMPLEMENTARY(p, q))
+        return BX_IncRef(q);
+
+    return BX_Implies(p, q);
 }
 
 
@@ -351,76 +434,76 @@ _ite_simplify(struct BoolExpr *op)
     struct BoolExpr *d1 = op->data.xs->items[1];
     struct BoolExpr *d0 = op->data.xs->items[2];
 
+    struct BoolExpr *sn;
     struct BoolExpr *y;
 
     /* ITE(0, d1, d0) <=> d0 */
-    if (IS_ZERO(s)) {
-        y = BoolExpr_IncRef(d0);
-    }
+    if (BX_IS_ZERO(s))
+        return BX_IncRef(d0);
+
     /* ITE(1, d1, d0) <=> d1 */
-    else if (IS_ONE(s)) {
-        y = BoolExpr_IncRef(d1);
-    }
-    else if (IS_ZERO(d1)) {
+    if (BX_IS_ONE(s))
+        return BX_IncRef(d1);
+
+    if (BX_IS_ZERO(d1)) {
         /* ITE(s, 0, 0) <=> 0 */
-        if (IS_ZERO(d0)) {
-            y = BoolExpr_IncRef(&Zero);
-        }
+        if (BX_IS_ZERO(d0))
+            return BX_IncRef(&BX_Zero);
+
         /* ITE(s, 0, 1) <=> ~s */
-        else if (IS_ONE(d0)) {
-            CHECK_NULL(y, Not(s));
-        }
+        if (BX_IS_ONE(d0))
+            return BX_Not(s);
+
         /* ITE(s, 0, d0) <=> And(~s, d0) */
-        else {
-            struct BoolExpr *sn;
-            CHECK_NULL(sn, Not(s));
-            CHECK_NULL_1(y, _simple_opn(OP_AND, 2, sn, d0), sn);
-            BoolExpr_DecRef(sn);
-        }
-    }
-    else if (IS_ONE(d1)) {
-        /* ITE(s, 1, 0) <=> s */
-        if (IS_ZERO(d0))
-            y = BoolExpr_IncRef(s);
-        /* ITE(s, 1, 1) <=> 1 */
-        else if (IS_ONE(d0))
-            y = BoolExpr_IncRef(&One);
-        /* ITE(s, 1, d0) <=> Or(s, d0) */
-        else
-            CHECK_NULL(y, _simple_opn(OP_OR, 2, s, d0));
-    }
-    /* ITE(s, d1, 0) <=> And(s, d1) */
-    else if (IS_ZERO(d0)) {
-        CHECK_NULL(y, _simple_opn(OP_AND, 2, s, d1));
-    }
-    /* ITE(s, d1, 1) <=> Or(~s, d1) */
-    else if (IS_ONE(d0)) {
-        struct BoolExpr *sn;
-        CHECK_NULL(sn, Not(s));
-        CHECK_NULL_1(y, _simple_opn(OP_OR, 2, sn, d1), sn);
-        BoolExpr_DecRef(sn);
-    }
-    /* ITE(s, d1, d1) <=> d1 */
-    else if (_eq(d1, d0)) {
-        y = BoolExpr_IncRef(d1);
-    }
-    /* ITE(s, s, d0) <=> Or(s, d0) */
-    else if (_eq(s, d1)) {
-        CHECK_NULL(y, _simple_opn(OP_OR, 2, s, d0));
-    }
-    /* ITE(s, d1, s) <=> And(s, d1) */
-    else if (_eq(s, d0)) {
-        CHECK_NULL(y, _simple_opn(OP_AND, 2, s, d1));
-    }
-    else {
-        CHECK_NULL(y, ITE(s, d1, d0));
+        CHECK_NULL(sn, BX_Not(s));
+        y = _simple_op2(BX_OP_AND, sn, d0);
+        BX_DecRef(sn);
+        return y;
     }
 
-    return y;
+    if (BX_IS_ONE(d1)) {
+        /* ITE(s, 1, 0) <=> s */
+        if (BX_IS_ZERO(d0))
+            return BX_IncRef(s);
+
+        /* ITE(s, 1, 1) <=> 1 */
+        if (BX_IS_ONE(d0))
+            return BX_IncRef(&BX_One);
+
+        /* ITE(s, 1, d0) <=> Or(s, d0) */
+        return _simple_op2(BX_OP_OR, s, d0);
+    }
+
+    /* ITE(s, d1, 0) <=> And(s, d1) */
+    if (BX_IS_ZERO(d0))
+        return _simple_op2(BX_OP_AND, s, d1);
+
+    /* ITE(s, d1, 1) <=> Or(~s, d1) */
+    if (BX_IS_ONE(d0)) {
+        CHECK_NULL(sn, BX_Not(s));
+        y = _simple_op2(BX_OP_OR, sn, d1);
+        BX_DecRef(sn);
+        return y;
+    }
+
+    /* ITE(s, d1, d1) <=> d1 */
+    if (_eq(d1, d0))
+        return BX_IncRef(d1);
+
+    /* ITE(s, s, d0) <=> Or(s, d0) */
+    if (_eq(s, d1))
+        return _simple_op2(BX_OP_OR, s, d0);
+
+    /* ITE(s, d1, s) <=> And(s, d1) */
+    if (_eq(s, d0))
+        return _simple_op2(BX_OP_AND, s, d1);
+
+    return BX_ITE(s, d1, d0);
 }
 
 
-static struct BoolExpr * (*_op_simplify[16])(struct BoolExpr *op) = {
+static struct BoolExpr *
+(*_op_simplify[16])(struct BoolExpr *op) = {
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL,
 
@@ -437,61 +520,67 @@ static struct BoolExpr * (*_op_simplify[16])(struct BoolExpr *op) = {
 
 
 static struct BoolExpr *
-_simple_op(BoolExprKind kind, size_t n, struct BoolExpr **xs)
+_simple_op(BX_Kind kind, size_t n, struct BoolExpr **xs)
 {
     struct BoolExpr *temp;
     struct BoolExpr *y;
 
-    CHECK_NULL(temp, _op_new(kind, n, xs));
-    CHECK_NULL_1(y, _op_simplify[kind](temp), temp);
-    BoolExpr_DecRef(temp);
+    CHECK_NULL(temp, _bx_op_new(kind, n, xs));
+    y = _op_simplify[kind](temp);
+    BX_DecRef(temp);
 
     return y;
 }
 
 
 static struct BoolExpr *
-_simple_opn(BoolExprKind kind, size_t n, ...)
+_simple_op2(BX_Kind kind, struct BoolExpr *x0, struct BoolExpr *x1)
 {
-    struct BoolExpr *xs[n];
-    va_list vl;
+    struct BoolExpr *xs[2] = {x0, x1};
 
-    va_start(vl, n);
-    for (int i = 0; i < n; ++i)
-        xs[i] = va_arg(vl, struct BoolExpr *);
-    va_end(vl);
-
-    return _simple_op(kind, n, xs);
+    return _simple_op(kind, 2, xs);
 }
 
 
-struct BoolExpr *
-_simplify(struct BoolExpr *ex)
+static struct BoolExpr *
+_simple_nop(BX_Kind kind, size_t n, struct BoolExpr **xs)
 {
+    struct BoolExpr *temp;
     struct BoolExpr *y;
 
-    if (IS_SIMPLE(ex)) {
-        y = BoolExpr_IncRef(ex);
-    }
-    else {
-        struct BoolExpr *temp;
-        CHECK_NULL(temp, _op_transform(ex, _simplify));
-        CHECK_NULL_1(y, _op_simplify[temp->kind](temp), temp);
-        BoolExpr_DecRef(temp);
-    }
+    temp = _simple_op(kind, n, xs);
+    y = BX_Not(temp);
+    BX_DecRef(temp);
 
     return y;
 }
 
 
 struct BoolExpr *
-BoolExpr_Simplify(struct BoolExpr *ex)
+_bx_simplify(struct BoolExpr *ex)
+{
+    if (BX_IS_SIMPLE(ex))
+        return BX_IncRef(ex);
+
+    struct BoolExpr *temp;
+    struct BoolExpr *y;
+
+    CHECK_NULL(temp, _bx_op_transform(ex, _bx_simplify));
+    y = _op_simplify[temp->kind](temp);
+    BX_DecRef(temp);
+
+    return y;
+}
+
+
+struct BoolExpr *
+BX_Simplify(struct BoolExpr *ex)
 {
     struct BoolExpr *y;
 
-    CHECK_NULL(y, _simplify(ex));
+    CHECK_NULL(y, _bx_simplify(ex));
 
-    _mark_flags(y, SIMPLE);
+    _bx_mark_flags(y, BX_SIMPLE);
 
     return y;
 }

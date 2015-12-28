@@ -10,183 +10,162 @@
 #include "boolexpr.h"
 
 
+/* Maximum load allowed before enlargement */
 #define MAX_LOAD 1.5
 
-
-/*
-** From: http://planetmath.org/goodhashtableprimes
-*/
-
-#define _MIN_IDX 5
-#define _MAX_IDX 30
-
-static size_t _primes[] = {
-    0, 0, 0, 0, 0,
-
-    /* (2^5,  2^6)  */ 53,
-    /* (2^6,  2^7)  */ 97,
-    /* (2^7,  2^8)  */ 193,
-    /* (2^8,  2^9)  */ 389,
-    /* (2^9,  2^10) */ 769,
-    /* (2^10, 2^11) */ 1543,
-    /* (2^11, 2^12) */ 3079,
-    /* (2^12, 2^13) */ 6151,
-    /* (2^13, 2^14) */ 12289,
-    /* (2^14, 2^15) */ 24593,
-    /* (2^15, 2^16) */ 49157,
-    /* (2^16, 2^17) */ 98317,
-    /* (2^17, 2^18) */ 196613,
-    /* (2^18, 2^19) */ 393241,
-    /* (2^19, 2^20) */ 786433,
-    /* (2^20, 2^21) */ 1572869,
-    /* (2^21, 2^22) */ 3145739,
-    /* (2^22, 2^23) */ 6291469,
-    /* (2^23, 2^24) */ 12582917,
-    /* (2^24, 2^25) */ 25165843,
-    /* (2^25, 2^26) */ 50331653,
-    /* (2^26, 2^27) */ 100663319,
-    /* (2^27, 2^28) */ 201326611,
-    /* (2^28, 2^29) */ 402653189,
-    /* (2^29, 2^30) */ 805306457,
-    /* (2^30, 2^31) */ 1610612741,
-};
+/* Min/Max indices in the primes table */
+#define MIN_IDX 4
+#define MAX_IDX 30
 
 
-struct BoolExprDictItem {
-    struct BoolExpr *key;
-    struct BoolExpr *val;
-    struct BoolExprDictItem *tail;
-};
+/* Define static size_t _primes[] */
+#include "primes-inl.c"
+
+
+static size_t
+_hash(struct BX_Dict *dict, struct BoolExpr *key)
+{
+    return (size_t) key % _primes[dict->_pridx];
+}
+
+
+static bool
+_eq(struct BoolExpr *key1, struct BoolExpr *key2)
+{
+    return key1 == key2;
+}
 
 
 static void
-_list_del(struct BoolExprDictItem *list)
+_list_del(struct BX_DictItem *list)
 {
-    if (list != (struct BoolExprDictItem *) NULL) {
+    if (list) {
         _list_del(list->tail);
-        BoolExpr_DecRef(list->key);
-        BoolExpr_DecRef(list->val);
-
+        BX_DecRef(list->key);
+        BX_DecRef(list->val);
         free(list);
     }
 }
 
 
 static struct BoolExpr *
-_list_search(struct BoolExprDictItem *list, struct BoolExpr *key)
+_list_search(struct BX_DictItem *list, struct BoolExpr *key)
 {
-    if (list == (struct BoolExprDictItem *) NULL)
+    if (!list)
         return (struct BoolExpr *) NULL;
-    else if (list->key == key)
+
+    if (_eq(list->key, key))
         return list->val;
-    else
-        return _list_search(list->tail, key);
+
+    return _list_search(list->tail, key);
 }
 
 
-struct BoolExprDict *
-BoolExprDict_New(size_t (*prehash)(struct BoolExpr *))
+struct BX_Dict *
+BX_Dict_New(void)
 {
-    struct BoolExprDict *dict;
-    size_t pridx = _MIN_IDX;
-    size_t width = _primes[pridx];
+    struct BX_Dict *dict;
+    size_t width = _primes[MIN_IDX];
 
-    dict = (struct BoolExprDict *) malloc(sizeof(struct BoolExprDict));
+    dict = malloc(sizeof(struct BX_Dict));
     if (dict == NULL)
         return NULL; // LCOV_EXCL_LINE
 
-    dict->items = (struct BoolExprDictItem **) malloc(width * sizeof(struct BoolExprDictItem *));
+    dict->_pridx = MIN_IDX;
+    dict->length = 0;
+    dict->items = malloc(width * sizeof(struct BX_DictItem *));
     if (dict->items == NULL) {
         free(dict);  // LCOV_EXCL_LINE
         return NULL; // LCOV_EXCL_LINE
     }
 
+    /* Initialize items to NULL */
     for (size_t i = 0; i < width; ++i)
-        dict->items[i] = (struct BoolExprDictItem *) NULL;
-
-    dict->prehash = prehash;
-    dict->length = 0;
-    dict->pridx = pridx;
+        dict->items[i] = (struct BX_DictItem *) NULL;
 
     return dict;
 }
 
 
-static size_t
-_var2int(struct BoolExpr *var)
-{
-    return (size_t) (var->data.lit.uniqid - 1);
-}
-
-
-/* {var: ex} mapping */
-struct BoolExprDict *
-BoolExprVarMap_New(void)
-{
-    return BoolExprDict_New(_var2int);
-}
-
-
-static size_t
-_lit2int(struct BoolExpr *lit)
-{
-    return (size_t) (lit->data.lit.uniqid < 0 ? -2 * lit->data.lit.uniqid - 2
-                                              :  2 * lit->data.lit.uniqid - 1);
-}
-
-
-/* {lit: ex} mapping */
-struct BoolExprDict *
-BoolExprLitMap_New(void)
-{
-    return BoolExprDict_New(_lit2int);
-}
-
-
 void
-BoolExprDict_Del(struct BoolExprDict *dict)
+BX_Dict_Del(struct BX_Dict *dict)
 {
-    for (size_t i = 0; i < _primes[dict->pridx]; ++i)
+    for (size_t i = 0; i < _primes[dict->_pridx]; ++i)
         _list_del(dict->items[i]);
-
     free(dict->items);
     free(dict);
 }
 
 
-static size_t
-_hash(struct BoolExprDict *dict, struct BoolExpr *key)
+void
+BX_DictIter_Init(struct BX_DictIter *it, struct BX_Dict *dict)
 {
-    return dict->prehash(key) % _primes[dict->pridx];
+    it->_dict = dict;
+    it->item = (struct BX_DictItem *) NULL;
+    it->done = true;
+
+    for (it->_index = 0; it->_index < _primes[dict->_pridx]; it->_index += 1) {
+        if (dict->items[it->_index]) {
+            it->item = dict->items[it->_index];
+            it->done = false;
+            break;
+        }
+    }
+}
+
+
+void
+BX_DictIter_Next(struct BX_DictIter *it)
+{
+    if (it->done)
+        return;
+
+    if (it->item->tail) {
+        it->item = it->item->tail;
+        return;
+    }
+
+    for (it->_index += 1; it->_index < _primes[it->_dict->_pridx]; it->_index += 1) {
+        if (it->_dict->items[it->_index]) {
+            it->item = it->_dict->items[it->_index];
+            return;
+        }
+    }
+
+    it->item = (struct BX_DictItem *) NULL;
+    it->done = true;
 }
 
 
 static bool
-_insert(struct BoolExprDict *dict, struct BoolExpr *key, struct BoolExpr *val)
+_dict_insert(struct BX_Dict *dict, struct BoolExpr *key, struct BoolExpr *val)
 {
-    size_t index = _hash(dict, key);;
-    struct BoolExprDictItem *item = dict->items[index];
+    size_t index = _hash(dict, key);
+    struct BX_DictItem *item;
+    struct BX_DictItem **tail;
 
-    while (item != (struct BoolExprDictItem *) NULL) {
-        if (item->key == key) {
-            BoolExpr_DecRef(item->key);
-            BoolExpr_DecRef(item->val);
-            item->key = BoolExpr_IncRef(key);
-            item->val = BoolExpr_IncRef(val);
+    tail = &dict->items[index];
+    for (item = dict->items[index]; item; item = item->tail) {
+        if (_eq(item->key, key)) {
+            BX_DecRef(item->key);
+            BX_DecRef(item->val);
+            item->key = BX_IncRef(key);
+            item->val = BX_IncRef(val);
             return true;
         }
-        item = item->tail;
+        tail = &item->tail;
     }
 
-    item = (struct BoolExprDictItem *) malloc(sizeof(struct BoolExprDictItem));
+    item = malloc(sizeof(struct BX_DictItem));
     if (item == NULL)
         return false; // LCOV_EXCL_LINE
 
-    item->key = BoolExpr_IncRef(key);
-    item->val = BoolExpr_IncRef(val);
-    item->tail = dict->items[index];
+    item->key = BX_IncRef(key);
+    item->val = BX_IncRef(val);
+    item->tail = (struct BX_DictItem *) NULL;
 
-    dict->items[index] = item;
+    *tail = item;
+
     dict->length += 1;
 
     return true;
@@ -194,34 +173,44 @@ _insert(struct BoolExprDict *dict, struct BoolExpr *key, struct BoolExpr *val)
 
 
 static bool
-_enlarge(struct BoolExprDict *dict)
+_enlarge(struct BX_Dict *dict)
 {
-    struct BoolExprDictItem *item;
+    struct BX_DictItem *item;
 
-    size_t pridx = dict->pridx;
-    struct BoolExprDictItem **items = dict->items;
+    size_t pridx = dict->_pridx;
+    size_t length = dict->length;
+    struct BX_DictItem **items = dict->items;
 
+    size_t old_width = _primes[pridx];
+    size_t new_width = _primes[pridx + 1];
+
+    dict->_pridx += 1;
     dict->length = 0;
-    dict->pridx += 1;
-    dict->items = (struct BoolExprDictItem **) malloc(_primes[dict->pridx] * sizeof(struct BoolExprDictItem *));
-    for (size_t i = 0; i < _primes[dict->pridx]; ++i)
-        dict->items[i] = (struct BoolExprDictItem *) NULL;
+    dict->items = malloc(new_width * sizeof(struct BX_DictItem *));
+    if (dict->items == NULL)
+        return false; // LCOV_EXCL_LINE
 
-    for (size_t i = 0; i < _primes[pridx]; ++i) {
-        item = items[i];
-        while (item != (struct BoolExprDictItem *) NULL) {
-            if (!_insert(dict, item->key, item->val)) {
+    for (size_t i = 0; i < new_width; ++i)
+        dict->items[i] = (struct BX_DictItem *) NULL;
+
+    for (size_t i = 0; i < old_width; ++i) {
+        for (item = items[i]; item; item = item->tail) {
+            if (!_dict_insert(dict, item->key, item->val)) {
                 /* LCOV_EXCL_START */
                 for (size_t j = 0; j < i; ++j)
-                    _list_del(items[j]);
-                free(items);
+                    _list_del(dict->items[j]);
+                free(dict->items);
+                dict->_pridx = pridx;
+                dict->length = length;
+                dict->items = items;
                 return false;
                 /* LCOV_EXCL_STOP */
             }
-            item = item->tail;
         }
-        _list_del(items[i]);
     }
+
+    for (size_t i = 0; i < old_width; ++i)
+        _list_del(items[i]);
     free(items);
 
     return true;
@@ -229,16 +218,16 @@ _enlarge(struct BoolExprDict *dict)
 
 
 bool
-BoolExprDict_Insert(struct BoolExprDict *dict, struct BoolExpr *key, struct BoolExpr *val)
+BX_Dict_Insert(struct BX_Dict *dict, struct BoolExpr *key, struct BoolExpr *val)
 {
     double load;
 
-    if (!_insert(dict, key, val))
+    if (!_dict_insert(dict, key, val))
         return false; // LCOV_EXCL_LINE
 
-    load = (double) dict->length / (double) _primes[dict->pridx];
+    load = (double) dict->length / (double) _primes[dict->_pridx];
 
-    if (dict->pridx < _MAX_IDX && load > MAX_LOAD) {
+    if (dict->_pridx < MAX_IDX && load > MAX_LOAD) {
         if (!_enlarge(dict))
             return false; // LCOV_EXCL_LINE
     }
@@ -248,25 +237,23 @@ BoolExprDict_Insert(struct BoolExprDict *dict, struct BoolExpr *key, struct Bool
 
 
 bool
-BoolExprDict_Remove(struct BoolExprDict *dict, struct BoolExpr *key)
+BX_Dict_Remove(struct BX_Dict *dict, struct BoolExpr *key)
 {
     size_t index = _hash(dict, key);
-    struct BoolExprDictItem **p = &dict->items[index];
-    struct BoolExprDictItem *item = dict->items[index];
+    struct BX_DictItem *item;
+    struct BX_DictItem **tail;
 
-    while (item != (struct BoolExprDictItem *) NULL) {
-        if (item->key == key) {
-            BoolExpr_DecRef(item->key);
-            BoolExpr_DecRef(item->val);
-            *p = item->tail;
+    tail = &dict->items[index];
+    for (item = dict->items[index]; item; item = item->tail) {
+        if (_eq(item->key, key)) {
+            BX_DecRef(item->key);
+            BX_DecRef(item->val);
+            *tail = item->tail;
             free(item);
             dict->length -= 1;
-
             return true;
         }
-
-        p = &item->tail;
-        item = item->tail;
+        tail = &item->tail;
     }
 
     return false;
@@ -274,7 +261,7 @@ BoolExprDict_Remove(struct BoolExprDict *dict, struct BoolExpr *key)
 
 
 struct BoolExpr *
-BoolExprDict_Search(struct BoolExprDict *dict, struct BoolExpr *key)
+BX_Dict_Search(struct BX_Dict *dict, struct BoolExpr *key)
 {
     size_t index = _hash(dict, key);
 
@@ -283,10 +270,60 @@ BoolExprDict_Search(struct BoolExprDict *dict, struct BoolExpr *key)
 
 
 bool
-BoolExprDict_Contains(struct BoolExprDict *dict, struct BoolExpr *key)
+BX_Dict_Contains(struct BX_Dict *dict, struct BoolExpr *key)
 {
     size_t index = _hash(dict, key);
 
     return _list_search(dict->items[index], key) != (struct BoolExpr *) NULL;
+}
+
+
+void
+BX_Dict_Clear(struct BX_Dict *dict)
+{
+    for (size_t i = 0; i < _primes[dict->_pridx]; ++i) {
+        if (dict->items[i]) {
+            _list_del(dict->items[i]);
+            dict->items[i] = (struct BX_DictItem *) NULL;
+        }
+    }
+
+    dict->length = 0;
+}
+
+
+bool
+BX_Dict_Equal(struct BX_Dict *self, struct BX_Dict *other)
+{
+    if (self->length != other->length)
+        return false;
+
+    struct BX_DictItem *item;
+
+    /* All items in self must also be in other (and vice versa) */
+    for (size_t i = 0; i < _primes[self->_pridx]; ++i) {
+        for (item = self->items[i]; item; item = item->tail) {
+            if (item->val != BX_Dict_Search(other, item->key))
+                return false;
+        }
+    }
+
+    return true;
+}
+
+
+bool
+BX_Dict_Update(struct BX_Dict *self, struct BX_Dict *other)
+{
+    struct BX_DictItem *item;
+
+    for (size_t i = 0; i < _primes[other->_pridx]; ++i) {
+        for (item = other->items[i]; item; item = item->tail) {
+            if (!BX_Dict_Insert(self, item->key, item->val))
+                return false; // LCOV_EXCL_LINE
+        }
+    }
+
+    return true;
 }
 

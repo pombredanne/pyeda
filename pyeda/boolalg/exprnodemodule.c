@@ -45,21 +45,21 @@ typedef struct {
     PyObject_HEAD
 
     struct BoolExpr *ex;
-    struct BoolExprIter *it;
+    struct BX_Iter *it;
 } ExprNode;
 
 
-static ExprNode *_Zero;
-static ExprNode *_One;
+static ExprNode *Zero;
+static ExprNode *One;
 
 
-static struct BoolExprVector *lits;
+static struct BX_Vector *lits;
 
 
 static PyObject *
 ExprNode_iter(ExprNode *self)
 {
-    self->it = BoolExprIter_New(self->ex);
+    self->it = BX_Iter_New(self->ex);
     if (self->it == NULL)
         return NULL;
 
@@ -108,7 +108,7 @@ _node2ast(struct BoolExpr *ex)
 {
     PyObject *ast;
 
-    if (IS_CONST(ex)) {
+    if (BX_IS_CONST(ex)) {
         PyObject *s, *l;
 
         s = PyUnicode_FromString(ASTOPS[0]);
@@ -131,7 +131,7 @@ _node2ast(struct BoolExpr *ex)
         PyTuple_SET_ITEM(ast, 0, s);
         PyTuple_SET_ITEM(ast, 1, l);
     }
-    else if (IS_LIT(ex)) {
+    else if (BX_IS_LIT(ex)) {
         PyObject *s, *l;
 
         s = PyUnicode_FromString(ASTOPS[1]);
@@ -155,14 +155,21 @@ _node2ast(struct BoolExpr *ex)
         PyTuple_SET_ITEM(ast, 1, l);
     }
     else {
-        int i, j;
+        size_t i, j;
         PyObject *s;
-        PyObject *asts[ex->data.xs->length];
 
         /* FIXME: magic number: 6 */
         s = PyUnicode_FromString(ASTOPS[(int) (ex->kind - 6)]);
         if (s == NULL)
             return NULL;
+
+        PyObject **asts;
+
+        asts = (PyObject **) PyMem_Malloc(ex->data.xs->length * sizeof(PyObject *));
+        if (asts == NULL) {
+            Py_DECREF(s);
+            return NULL;
+        }
 
         for (i = 0; i < ex->data.xs->length; ++i) {
             asts[i] = _node2ast(ex->data.xs->items[i]);
@@ -170,6 +177,7 @@ _node2ast(struct BoolExpr *ex)
                 Py_DECREF(s);
                 for (j = 0; j < i; ++j)
                     Py_DECREF(asts[j]);
+                PyMem_Free(asts);
                 return NULL;
             }
         }
@@ -179,12 +187,15 @@ _node2ast(struct BoolExpr *ex)
             Py_DECREF(s);
             for (i = 0; i < ex->data.xs->length; ++i)
                 Py_DECREF(asts[i]);
+            PyMem_Free(asts);
             return NULL;
         }
 
         PyTuple_SET_ITEM(ast, 0, s);
         for (i = 0; i < ex->data.xs->length; ++i)
             PyTuple_SET_ITEM(ast, i+1, asts[i]);
+
+        PyMem_Free(asts);
     }
 
     return ast;
@@ -244,7 +255,7 @@ PyDoc_STRVAR(depth_doc,
 static PyObject *
 ExprNode_depth(ExprNode *self)
 {
-    return PyLong_FromLong((long) BoolExpr_Depth(self->ex));
+    return PyLong_FromLong((long) BX_Depth(self->ex));
 }
 
 
@@ -261,7 +272,7 @@ PyDoc_STRVAR(size_doc,
 static PyObject *
 ExprNode_size(ExprNode *self)
 {
-    return PyLong_FromLong((long) BoolExpr_Size(self->ex));
+    return PyLong_FromLong((long) BX_Size(self->ex));
 }
 
 
@@ -273,7 +284,7 @@ PyDoc_STRVAR(is_dnf_doc,
 static PyObject *
 ExprNode_is_dnf(ExprNode *self)
 {
-    return PyBool_FromLong((long) BoolExpr_IsDNF(self->ex));
+    return PyBool_FromLong((long) BX_IsDNF(self->ex));
 }
 
 
@@ -285,7 +296,7 @@ PyDoc_STRVAR(is_cnf_doc,
 static PyObject *
 ExprNode_is_cnf(ExprNode *self)
 {
-    return PyBool_FromLong((long) BoolExpr_IsCNF(self->ex));
+    return PyBool_FromLong((long) BX_IsCNF(self->ex));
 }
 
 
@@ -332,7 +343,7 @@ PyDoc_STRVAR(simple_doc,
 static PyObject *
 ExprNode_simple(ExprNode *self)
 {
-    return PyBool_FromLong((long) self->ex->flags & SIMPLE);
+    return PyBool_FromLong((long) self->ex->flags & BX_SIMPLE);
 }
 
 
@@ -401,7 +412,7 @@ ExprNode_methods[] = {
 static void
 ExprNode_dealloc(ExprNode *self)
 {
-    BoolExpr_DecRef(self->ex);
+    BX_DecRef(self->ex);
     Py_TYPE(self)->tp_free((PyObject *) self);
 }
 
@@ -417,7 +428,7 @@ ExprNode_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
 static int
 ExprNode_init(ExprNode *self, PyObject *args, PyObject *kwargs)
 {
-    self->it = (struct BoolExprIter *) NULL;
+    self->it = (struct BX_Iter *) NULL;
     return 0;
 }
 
@@ -474,22 +485,24 @@ ExprNode_T = {
 static PyObject *
 ExprNode_next(ExprNode *self)
 {
+    ExprNode *node;
+
     if (self->it->done) {
-        BoolExprIter_Del(self->it);
+        BX_Iter_Del(self->it);
         /* StopIteration */
         return NULL;
     }
-    else {
-        struct BoolExpr *ex = BoolExprIter_Next(self->it);
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExprIter_Del(self->it);
-            return NULL;
-        }
-        pyex->ex = BoolExpr_IncRef(ex);
 
-        return (PyObject *) pyex;
+    node = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (node == NULL) {
+        BX_Iter_Del(self->it);
+        return NULL;
     }
+    node->ex = BX_IncRef(self->it->item);
+
+    BX_Iter_Next(self->it);
+
+    return (PyObject *) node;
 }
 
 
@@ -503,7 +516,7 @@ ExprNode_restrict(ExprNode *self, PyObject *args)
     Py_ssize_t pos = 0;
     PyObject *key, *val;
 
-    struct BoolExprDict *var2ex;
+    struct BX_Dict *var2ex;
 
     if (!PyArg_ParseTuple(args, "O", &point))
         return NULL;
@@ -513,34 +526,33 @@ ExprNode_restrict(ExprNode *self, PyObject *args)
         return NULL;
     }
 
-    var2ex = BoolExprVarMap_New();
+    var2ex = BX_Dict_New();
     /* FIXME: check var2ex == NULL */
     while (PyDict_Next(point, &pos, &key, &val)) {
-        BoolExprDict_Insert(var2ex, NODE(key), NODE(val));
+        BX_Dict_Insert(var2ex, NODE(key), NODE(val));
     }
 
-    if ((ex = BoolExpr_Restrict(self->ex, var2ex)) == NULL) {
-        BoolExprDict_Del(var2ex);
-        PyErr_SetString(Error, "BoolExpr_Restrict failed");
+    if ((ex = BX_Restrict(self->ex, var2ex)) == NULL) {
+        BX_Dict_Del(var2ex);
+        PyErr_SetString(Error, "BX_Restrict failed");
         return NULL;
     }
 
-    BoolExprDict_Del(var2ex);
+    BX_Dict_Del(var2ex);
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -554,7 +566,7 @@ ExprNode_compose(ExprNode *self, PyObject *args)
     Py_ssize_t pos = 0;
     PyObject *key, *val;
 
-    struct BoolExprDict *var2ex;
+    struct BX_Dict *var2ex;
 
     if (!PyArg_ParseTuple(args, "O", &mapping))
         return NULL;
@@ -564,34 +576,33 @@ ExprNode_compose(ExprNode *self, PyObject *args)
         return NULL;
     }
 
-    var2ex = BoolExprVarMap_New();
+    var2ex = BX_Dict_New();
     /* FIXME: check var2ex == NULL */
     while (PyDict_Next(mapping, &pos, &key, &val)) {
-        BoolExprDict_Insert(var2ex, NODE(key), NODE(val));
+        BX_Dict_Insert(var2ex, NODE(key), NODE(val));
     }
 
-    if ((ex = BoolExpr_Compose(self->ex, var2ex)) == NULL) {
-        BoolExprDict_Del(var2ex);
-        PyErr_SetString(Error, "BoolExpr_Compose failed");
+    if ((ex = BX_Compose(self->ex, var2ex)) == NULL) {
+        BX_Dict_Del(var2ex);
+        PyErr_SetString(Error, "BX_Compose failed");
         return NULL;
     }
 
-    BoolExprDict_Del(var2ex);
+    BX_Dict_Del(var2ex);
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -599,42 +610,49 @@ ExprNode_compose(ExprNode *self, PyObject *args)
 static PyObject *
 ExprNode_data(ExprNode *self)
 {
-    if (IS_CONST(self->ex)) {
+    if (BX_IS_CONST(self->ex))
         return PyLong_FromLong((long) self->ex->data.pcval);
-    }
-    else if (IS_LIT(self->ex)) {
+
+    if (BX_IS_LIT(self->ex))
         return PyLong_FromLong(self->ex->data.lit.uniqid);
-    }
-    else if (IS_OP(self->ex)) {
-        int i, j;
-        ExprNode *nodes[self->ex->data.xs->length];
+
+    if (BX_IS_OP(self->ex)) {
+        size_t i, j;
+        ExprNode **nodes;
         PyObject *xs;
+
+        nodes = (ExprNode **) PyMem_Malloc(self->ex->data.xs->length * sizeof(ExprNode *));
+        if (nodes == NULL)
+            return NULL;
 
         for (i = 0; i < self->ex->data.xs->length; ++i) {
             nodes[i] = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
             if (nodes[i] == NULL) {
                 for (j = 0; j < i; ++j)
                     Py_DECREF(nodes[j]);
+                PyMem_Free(nodes);
                 return NULL;
             }
-            nodes[i]->ex = BoolExpr_IncRef(self->ex->data.xs->items[i]);
+            nodes[i]->ex = BX_IncRef(self->ex->data.xs->items[i]);
         }
 
         xs = PyTuple_New(self->ex->data.xs->length);
         if (xs == NULL) {
             for (i = 0; i < self->ex->data.xs->length; ++i)
                 Py_DECREF(nodes[i]);
+            PyMem_Free(nodes);
             return NULL;
         }
 
         for (i = 0; i < self->ex->data.xs->length; ++i)
             PyTuple_SET_ITEM(xs, i, (PyObject *) nodes[i]);
 
+        PyMem_Free(nodes);
+
         return xs;
     }
-    else {
-        Py_RETURN_NONE;
-    }
+
+    Py_RETURN_NONE;
 }
 
 
@@ -644,25 +662,24 @@ ExprNode_pushdown_not(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_PushDownNot(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_PushDownNot failed");
+    if ((ex = BX_PushDownNot(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_PushDownNot failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -672,25 +689,24 @@ ExprNode_simplify(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_Simplify(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_Simplify failed");
+    if ((ex = BX_Simplify(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_Simplify failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -700,25 +716,24 @@ ExprNode_to_binary(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_ToBinary(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_ToBinary failed");
+    if ((ex = BX_ToBinary(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_ToBinary failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -727,25 +742,24 @@ ExprNode_to_nnf(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_ToNNF(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_ToNNF failed");
+    if ((ex = BX_ToNNF(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_ToNNF failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -754,25 +768,24 @@ ExprNode_to_dnf(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_ToDNF(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_ToDNF failed");
+    if ((ex = BX_ToDNF(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_ToDNF failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -781,25 +794,24 @@ ExprNode_to_cnf(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_ToCNF(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_ToCNF failed");
+    if ((ex = BX_ToCNF(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_ToCNF failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -808,25 +820,24 @@ ExprNode_complete_sum(ExprNode *self)
 {
     struct BoolExpr *ex;
 
-    if ((ex = BoolExpr_CompleteSum(self->ex)) == NULL) {
-        PyErr_SetString(Error, "BoolExpr_CompleteSum failed");
+    if ((ex = BX_CompleteSum(self->ex)) == NULL) {
+        PyErr_SetString(Error, "BX_CompleteSum failed");
         return NULL;
     }
 
     if (ex == self->ex) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         Py_INCREF((PyObject *) self);
         return (PyObject *) self;
     }
-    else {
-        ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-        if (pyex == NULL) {
-            BoolExpr_DecRef(ex);
-            return NULL;
-        }
-        pyex->ex = ex;
-        return (PyObject *) pyex;
+
+    ExprNode *pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (pyex == NULL) {
+        BX_DecRef(ex);
+        return NULL;
     }
+    pyex->ex = ex;
+    return (PyObject *) pyex;
 }
 
 
@@ -859,14 +870,14 @@ lit(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    if ((ex = Literal(lits, uniqid)) == NULL) {
-        PyErr_SetString(Error, "boolexpr::Literal failed");
+    if ((ex = BX_Literal(lits, uniqid)) == NULL) {
+        PyErr_SetString(Error, "BX_Literal failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         return NULL;
     }
     pyex->ex = ex;
@@ -904,14 +915,14 @@ not_(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    if ((ex = Not(NODE(x))) == NULL) {
-        PyErr_SetString(Error, "boolexpr::Not failed");
+    if ((ex = BX_Not(NODE(x))) == NULL) {
+        PyErr_SetString(Error, "BX_Not failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         return NULL;
     }
     pyex->ex = ex;
@@ -981,15 +992,15 @@ or_(PyObject *self, PyObject *args)
     if (xs == NULL)
         return NULL;
 
-    if ((ex = Or(n, xs)) == NULL) {
+    if ((ex = BX_Or(n, xs)) == NULL) {
         PyMem_Free(xs);
-        PyErr_SetString(Error, "boolexpr::Or failed");
+        PyErr_SetString(Error, "BX_Or failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         PyMem_Free(xs);
         return NULL;
     }
@@ -1025,15 +1036,15 @@ and_(PyObject *self, PyObject *args)
     if (xs == NULL)
         return NULL;
 
-    if ((ex = And(n, xs)) == NULL) {
+    if ((ex = BX_And(n, xs)) == NULL) {
         PyMem_Free(xs);
-        PyErr_SetString(Error, "boolexpr::And failed");
+        PyErr_SetString(Error, "BX_And failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         PyMem_Free(xs);
         return NULL;
     }
@@ -1069,15 +1080,15 @@ xor_(PyObject *self, PyObject *args)
     if (xs == NULL)
         return NULL;
 
-    if ((ex = Xor(n, xs)) == NULL) {
+    if ((ex = BX_Xor(n, xs)) == NULL) {
         PyMem_Free(xs);
-        PyErr_SetString(Error, "boolexpr::Xor failed");
+        PyErr_SetString(Error, "BX_Xor failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         PyMem_Free(xs);
         return NULL;
     }
@@ -1113,15 +1124,15 @@ eq(PyObject *self, PyObject *args)
     if (xs == NULL)
         return NULL;
 
-    if ((ex = Equal(n, xs)) == NULL) {
+    if ((ex = BX_Equal(n, xs)) == NULL) {
         PyMem_Free(xs);
-        PyErr_SetString(Error, "boolexpr::Equal failed");
+        PyErr_SetString(Error, "BX_Equal failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         PyMem_Free(xs);
         return NULL;
     }
@@ -1167,14 +1178,14 @@ impl(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    if ((ex = Implies(NODE(p), NODE(q))) == NULL) {
-        PyErr_SetString(Error, "boolexpr::Implies failed");
+    if ((ex = BX_Implies(NODE(p), NODE(q))) == NULL) {
+        PyErr_SetString(Error, "BX_Implies failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         return NULL;
     }
     pyex->ex = ex;
@@ -1215,23 +1226,25 @@ ite(PyObject *self, PyObject *args)
         PyErr_SetString(PyExc_TypeError, "expected s to be an ExprNode");
         return NULL;
     }
+
     if (!PyObject_IsInstance(d1, (PyObject *) &ExprNode_T)) {
         PyErr_SetString(PyExc_TypeError, "expected d1 to be an ExprNode");
         return NULL;
     }
+
     if (!PyObject_IsInstance(d0, (PyObject *) &ExprNode_T)) {
         PyErr_SetString(PyExc_TypeError, "expected d0 to be an ExprNode");
         return NULL;
     }
 
-    if ((ex = ITE(NODE(s), NODE(d1), NODE(d0))) == NULL) {
-        PyErr_SetString(Error, "boolexpr::ITE failed");
+    if ((ex = BX_ITE(NODE(s), NODE(d1), NODE(d0))) == NULL) {
+        PyErr_SetString(Error, "BX_ITE failed");
         return NULL;
     }
 
     pyex = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
     if (pyex == NULL) {
-        BoolExpr_DecRef(ex);
+        BX_DecRef(ex);
         return NULL;
     }
     pyex->ex = ex;
@@ -1313,48 +1326,48 @@ PyInit_exprnode(void)
         goto decref_ExprNode;
 
     /* Create constants */
-    _Zero = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-    if (_Zero == NULL)
+    Zero = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (Zero == NULL)
         goto decref_ExprNode;
-    _Zero->ex = BoolExpr_IncRef(&Zero);
-    if (PyModule_AddObject(m, "Zero", (PyObject *) _Zero) < 0)
+    Zero->ex = BX_IncRef(&BX_Zero);
+    if (PyModule_AddObject(m, "Zero", (PyObject *) Zero) < 0)
         goto decref_Zero;
 
     /* Create exprnode.One */
-    _One = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
-    if (_One == NULL)
+    One = (ExprNode *) PyObject_CallObject((PyObject *) &ExprNode_T, NULL);
+    if (One == NULL)
         goto decref_Zero;
-    _One->ex = BoolExpr_IncRef(&One);
-    if (PyModule_AddObject(m, "One", (PyObject *) _One) < 0)
+    One->ex = BX_IncRef(&BX_One);
+    if (PyModule_AddObject(m, "One", (PyObject *) One) < 0)
         goto decref_One;
 
     /* Create module-level literal vector */
-    lits = BoolExprVector_New();
+    lits = BX_Vector_New();
     if (lits == NULL)
         goto decref_One;
 
     /* Create constants */
-    if (PyModule_AddIntConstant(m, "ZERO", ZERO))
+    if (PyModule_AddIntConstant(m, "ZERO", BX_ZERO))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "ONE", ONE))
+    if (PyModule_AddIntConstant(m, "ONE", BX_ONE))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "COMP", COMP))
+    if (PyModule_AddIntConstant(m, "COMP", BX_COMP))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "VAR", VAR))
+    if (PyModule_AddIntConstant(m, "VAR", BX_VAR))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_OR", OP_OR))
+    if (PyModule_AddIntConstant(m, "OP_OR", BX_OP_OR))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_AND", OP_AND))
+    if (PyModule_AddIntConstant(m, "OP_AND", BX_OP_AND))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_XOR", OP_XOR))
+    if (PyModule_AddIntConstant(m, "OP_XOR", BX_OP_XOR))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_EQ", OP_EQ))
+    if (PyModule_AddIntConstant(m, "OP_EQ", BX_OP_EQ))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_NOT", OP_NOT))
+    if (PyModule_AddIntConstant(m, "OP_NOT", BX_OP_NOT))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_IMPL", OP_IMPL))
+    if (PyModule_AddIntConstant(m, "OP_IMPL", BX_OP_IMPL))
         goto undo_all;
-    if (PyModule_AddIntConstant(m, "OP_ITE", OP_ITE))
+    if (PyModule_AddIntConstant(m, "OP_ITE", BX_OP_ITE))
         goto undo_all;
 
     /* Success! */
@@ -1363,12 +1376,12 @@ PyInit_exprnode(void)
 /* Error! */
 undo_all:
 
-    BoolExprVector_Del(lits);
+    BX_Vector_Del(lits);
 
 decref_One:
-    Py_DECREF(_One);
+    Py_DECREF(One);
 decref_Zero:
-    Py_DECREF(_Zero);
+    Py_DECREF(Zero);
 decref_ExprNode:
     Py_DECREF((PyObject *) &ExprNode_T);
 decref_Error:
